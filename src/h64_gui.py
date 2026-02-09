@@ -30,7 +30,7 @@ from bleak import BleakClient
 from h64_logger import HR_SERVICE, HR_CHAR, BAT_CHAR, parse_hr, scan, service_uuids_lower
 
 WINDOW_SEC = 60.0
-
+DEFAULT_H64_ADDRESS = "1F14F124-7251-6307-EB35-9C839AA9EA9A"
 
 @dataclass
 class Sample:
@@ -86,8 +86,7 @@ class MainWindow(QMainWindow):
         self.address_edit.setPlaceholderText("Address (UUID). Можно подключаться без Scan.")
 
         saved_addr = (self.settings.value("last_address", "") or "").strip()
-        if saved_addr:
-            self.address_edit.setText(saved_addr)
+        self.address_edit.setText(saved_addr if saved_addr else DEFAULT_H64_ADDRESS)
 
         self.scan_timeout = QSpinBox()
         self.scan_timeout.setRange(3, 60)
