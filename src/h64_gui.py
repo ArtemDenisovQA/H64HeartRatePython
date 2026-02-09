@@ -30,7 +30,7 @@ from bleak import BleakClient
 from h64_logger import HR_SERVICE, HR_CHAR, BAT_CHAR, parse_hr, scan, service_uuids_lower
 
 WINDOW_SEC = 60.0
-DEFAULT_H64_ADDRESS = "1F14F124-7251-6307-EB35-9C839AA9EA9A"
+
 
 @dataclass
 class Sample:
@@ -61,6 +61,12 @@ class MainWindow(QMainWindow):
         self.connected_address: Optional[str] = None
         self.battery: Optional[int] = None
 
+        # ---- reconnect state ----
+        self.user_requested_disconnect = False
+        self._suppress_auto_reconnect = False
+        self.reconnect_task: Optional[asyncio.Task] = None
+        self.last_device_name: str = ""
+
         # ---- logging state ----
         self.log_path: Path = default_out_path()
         self.log_file = None
@@ -86,7 +92,8 @@ class MainWindow(QMainWindow):
         self.address_edit.setPlaceholderText("Address (UUID). Можно подключаться без Scan.")
 
         saved_addr = (self.settings.value("last_address", "") or "").strip()
-        self.address_edit.setText(saved_addr if saved_addr else DEFAULT_H64_ADDRESS)
+        if saved_addr:
+            self.address_edit.setText(saved_addr)
 
         self.scan_timeout = QSpinBox()
         self.scan_timeout.setRange(3, 60)
@@ -218,6 +225,150 @@ class MainWindow(QMainWindow):
             self.log_path = Path(path)
             self.log_label.setText(str(self.log_path))
 
+    # ---------------- BLE reconnect helpers ----------------
+
+    def _on_ble_disconnected(self, _client: BleakClient):
+        """Called by bleak from the event loop thread."""
+        if self.user_requested_disconnect or self._suppress_auto_reconnect:
+            return
+
+        self.status_signal.emit("connection lost — reconnecting…")
+
+        if self.reconnect_task and not self.reconnect_task.done():
+            return
+
+        self.reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _try_find_replacement_address(self) -> Optional[str]:
+        """Scan and try to find the same HR device again (address may change on some platforms)."""
+        found = await scan(timeout=6.0)
+        candidates: list[tuple[int, str, str]] = []
+
+        for addr, (dev, adv) in found.items():
+            uuids = service_uuids_lower(adv)
+            if HR_SERVICE not in uuids:
+                continue
+
+            name = (dev.name or "").strip()
+            score = 0
+            if self.last_device_name and name == self.last_device_name:
+                score -= 10
+            candidates.append((score, name, addr))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2]
+
+    async def _reconnect_loop(self):
+        backoff = 1
+
+        while not self.user_requested_disconnect:
+            addr = (self.connected_address or "").strip() or self.address_edit.text().strip()
+            if not addr:
+                self.status_signal.emit("reconnect: no saved address")
+                return
+
+            try:
+                await self._connect_to(addr, is_reconnect=True)
+                self.status_signal.emit(f"reconnected: {addr} (logging → {self.log_path})")
+                return
+            except Exception as e:
+                # Fallback: address may have changed -> scan to find HR device again
+                try:
+                    new_addr = await self._try_find_replacement_address()
+                    if new_addr and new_addr.lower() != addr.lower():
+                        self.connected_address = new_addr
+                        self.address_edit.setText(new_addr)
+
+                        await self._connect_to(new_addr, is_reconnect=True)
+                        self.status_signal.emit(f"reconnected: {new_addr} (logging → {self.log_path})")
+                        return
+                except Exception:
+                    pass
+
+                self.status_signal.emit(f"reconnect failed: {e} (retry in {backoff}s)")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+    async def _connect_to(self, address: str, *, is_reconnect: bool):
+        """Connect + (re)subscribe to HR/Battery notifications. Does NOT touch log file."""
+        self.status_signal.emit(("reconnecting" if is_reconnect else "connecting") + f" to {address}…")
+
+        # If we have an old client instance, disconnect it quietly (and don't start auto-reconnect from that)
+        if self.client is not None:
+            self._suppress_auto_reconnect = True
+            try:
+                try:
+                    await self.client.stop_notify(HR_CHAR)
+                except Exception:
+                    pass
+                try:
+                    await self.client.stop_notify(BAT_CHAR)
+                except Exception:
+                    pass
+                await self.client.disconnect()
+            except Exception:
+                pass
+            finally:
+                self._suppress_auto_reconnect = False
+
+        self.client = BleakClient(address)
+        try:
+            try:
+                self.client.set_disconnected_callback(self._on_ble_disconnected)
+            except Exception:
+                pass
+
+            await self.client.connect()
+        except Exception:
+            self.client = None
+            raise
+
+        self.connected_address = address
+        self.btn_connect.setEnabled(False)
+        self.btn_disconnect.setEnabled(True)
+
+        # try read battery immediately
+        try:
+            data = await self.client.read_gatt_char(BAT_CHAR)
+            if data:
+                self.battery = int(data[0])
+                self.battery_signal.emit(self.battery)
+        except Exception:
+            pass
+
+        # battery notify (optional)
+        def on_battery(_sender: int, data: bytearray):
+            if data:
+                self.battery = int(data[0])
+                self.battery_signal.emit(self.battery)
+
+        try:
+            await self.client.start_notify(BAT_CHAR, on_battery)
+        except Exception:
+            pass
+
+        # HR notify
+        def on_hr(_sender: int, data: bytearray):
+            bpm = parse_hr(data)
+            if bpm is None:
+                return
+            ts = time.time()
+            self.sample_signal.emit(ts, bpm)
+
+        try:
+            await self.client.start_notify(HR_CHAR, on_hr)
+        except Exception as e:
+            # If we can't subscribe to HR, disconnect and fail
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+            raise RuntimeError(f"notify failed: {e}") from e
+
     # ---------------- BLE actions (async) ----------------
 
     @asyncSlot()
@@ -256,20 +407,31 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_connect_clicked(self):
-        if self.client:
+        if self.client and getattr(self.client, "is_connected", False):
             self.status_signal.emit("already connected")
             return
+
+        # stop any old reconnect loop
+        self.user_requested_disconnect = False
+        if self.reconnect_task and not self.reconnect_task.done():
+            self.reconnect_task.cancel()
+        self.reconnect_task = None
 
         # priority: manual address -> selected from scan
         address = self.address_edit.text().strip()
         if not address:
             address = self.device_combo.currentData()
+            title = (self.device_combo.currentText() or "").strip()
+            # "NAME (addr)" -> "NAME"
+            self.last_device_name = title.rsplit(" (", 1)[0].strip()
+        else:
+            self.last_device_name = ""
 
         if not address:
             self.status_signal.emit("no address (paste it or Scan)")
             return
 
-        # reset stats
+        # reset stats (only on manual connect)
         self.samples = []
         self.bin_counts = {}
         self.total_samples = 0
@@ -278,73 +440,36 @@ class MainWindow(QMainWindow):
         self.range_lbl.setText("Most common 10-range: —")
         self.bpm_lbl.setText("BPM: —")
 
-        # open log file (new file per connection unless user selected specific)
+        # open log file (append if exists, to keep same file across disconnect/reconnect)
         if not self.log_path:
             self.log_path = default_out_path()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            self.log_file = open(self.log_path, "w", newline="", encoding="utf-8")
+            existed = self.log_path.exists() and self.log_path.stat().st_size > 0
+            mode = "a" if existed else "w"
+            self.log_file = open(self.log_path, mode, newline="", encoding="utf-8")
             self.log_writer = csv.writer(self.log_file)
-            self.log_writer.writerow(["timestamp", "bpm", "battery_percent"])
-            self.log_file.flush()
+            if not existed:
+                self.log_writer.writerow(["timestamp", "bpm", "battery_percent"])
+                self.log_file.flush()
         except Exception as e:
             self.status_signal.emit(f"log file error: {e}")
             self.log_file = None
             self.log_writer = None
             return
 
-        self.status_signal.emit(f"connecting to {address}…")
-
-        self.client = BleakClient(address)
+        # connect
         try:
-            await self.client.connect()
+            await self._connect_to(address, is_reconnect=False)
         except Exception as e:
             self.status_signal.emit(f"connect failed: {e}")
-            await self._cleanup_after_disconnect()
+            await self._cleanup_after_disconnect(close_log=True)
             return
 
-        self.connected_address = address
         # save address for next launches (auto-fill)
         self.settings.setValue("last_address", address)
 
-        # try read battery immediately
-        try:
-            data = await self.client.read_gatt_char(BAT_CHAR)
-            if data:
-                self.battery = int(data[0])
-                self.battery_signal.emit(self.battery)
-        except Exception:
-            pass
-
-        # battery notify (optional)
-        def on_battery(_sender: int, data: bytearray):
-            if data:
-                self.battery = int(data[0])
-                self.battery_signal.emit(self.battery)
-
-        try:
-            await self.client.start_notify(BAT_CHAR, on_battery)
-        except Exception:
-            pass
-
-        # HR notify
-        def on_hr(_sender: int, data: bytearray):
-            bpm = parse_hr(data)
-            if bpm is None:
-                return
-            ts = time.time()
-            self.sample_signal.emit(ts, bpm)
-
-        try:
-            await self.client.start_notify(HR_CHAR, on_hr)
-        except Exception as e:
-            self.status_signal.emit(f"notify failed: {e}")
-            await self._disconnect_internal()
-            return
-
-        self.btn_connect.setEnabled(False)
-        self.btn_disconnect.setEnabled(True)
         self.status_signal.emit(f"connected: {address} (logging → {self.log_path})")
 
     @asyncSlot()
@@ -352,7 +477,14 @@ class MainWindow(QMainWindow):
         await self._disconnect_internal()
 
     async def _disconnect_internal(self):
+        # manual disconnect: stop auto-reconnect and close log file
+        self.user_requested_disconnect = True
+        if self.reconnect_task and not self.reconnect_task.done():
+            self.reconnect_task.cancel()
+        self.reconnect_task = None
+
         if not self.client:
+            await self._cleanup_after_disconnect(close_log=True)
             return
 
         self.status_signal.emit("disconnecting…")
@@ -367,20 +499,20 @@ class MainWindow(QMainWindow):
                 pass
             await self.client.disconnect()
         finally:
-            await self._cleanup_after_disconnect()
+            await self._cleanup_after_disconnect(close_log=True)
             self.status_signal.emit("disconnected")
 
-    async def _cleanup_after_disconnect(self):
+    async def _cleanup_after_disconnect(self, *, close_log: bool):
         self.client = None
         self.connected_address = None
 
-        if self.log_file:
+        if close_log and self.log_file:
             try:
                 self.log_file.close()
             except Exception:
                 pass
-        self.log_file = None
-        self.log_writer = None
+            self.log_file = None
+            self.log_writer = None
 
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
