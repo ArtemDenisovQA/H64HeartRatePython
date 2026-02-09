@@ -1,120 +1,98 @@
-# H64HeartRatePython
+# Magene H64 — Heart Rate Logger (Python)
 
-Пэт‑проект на **Python** для **macOS**, который подключается к BLE‑датчику пульса **Magene H64**, получает **BPM** (Heart Rate Measurement), по возможности читает **Battery Level**, и **сохраняет данные в CSV‑файл**.
+Проект для **macOS**, который подключается по **Bluetooth LE** к нагрудному датчику пульса **Magene H64** и логирует данные.
 
-Репозиторий: https://github.com/ArtemDenisovQA/H64HeartRatePython
+## Что есть в проекте
+- **CLI**: `src/h64_logger.py`
+- **GUI**: `src/h64_gui.py` (график BPM в реальном времени, ось X = текущее время)
 
----
+## Возможности GUI
+- Scan устройств (по BLE)
+- Connect / Disconnect
+- Подключение **по адресу без сканирования** (вставь UUID в поле Address)
+- CSV-лог: `timestamp,bpm,battery_percent`
+- Статистика: самый частый диапазон 10 BPM (“Most common 10-range”)
 
-## Возможности
-
-- Поиск BLE‑устройств и вывод списка (`--list`)
-- Подключение к датчику по **адресу** (самый надёжный способ) или по подсказке имени (`--name`)
-- Вывод BPM в реальном времени в терминал
-- Чтение Battery Level (если датчик поддерживает характеристику 0x2A19)
-- Логирование в CSV в папку `logs/`
-- Изоляция зависимостей через виртуальное окружение `.venv`
+> На macOS (Bleak/CoreBluetooth) “address” часто выглядит как UUID (`1F14F124-...`).
+> Обычно он стабилен на одном и том же Mac для одного устройства, но иногда может измениться (сброс/forget Bluetooth и т.п.).
+> Поэтому GUI **сохраняет последний успешный address** и подставляет его при следующем запуске.
 
 ---
 
 ## Требования
+- macOS
+- Python 3.12+
+- Датчик должен быть активен (обычно “просыпается”, когда надет)
 
-- macOS с поддержкой Bluetooth LE
-- Python **3.12+** (рекомендуется через `pyenv`)
-- Разрешение Bluetooth для приложения, из которого запускаете скрипт (Terminal / VS Code)
-
----
-
-## Быстрый старт
-
-### 1) Клонирование
-
-```bash
-git clone https://github.com/ArtemDenisovQA/H64HeartRatePython.git
-cd H64HeartRatePython
-```
-
-### 2) Виртуальное окружение
+## Установка
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-Проверка (должно быть `.venv/bin/python`):
-
-```bash
-which python
-python --version
-```
-
-### 3) Установка зависимостей
-
-```bash
-pip install --upgrade pip
+pip install -U pip
 pip install -r requirements.txt
 ```
 
----
+## Запуск
 
-## Использование
-
-> Перед запуском **наденьте ремень/датчик**, чтобы Magene H64 «проснулся».
-
-### Показать список ближайших BLE‑устройств
+### GUI
 
 ```bash
-python src/h64_logger.py --list --scan-timeout 15
+source .venv/bin/activate
+python src/h64_gui.py
 ```
 
-В списке ищите устройство, помеченное `*HR*` (рекламирует Heart Rate Service), либо похожее по имени.
+**Как подключаться:**
+1. Если поле **Address** уже заполнено (подставился последний адрес) → нажми **Connect**
+2. Если адрес неизвестен → нажми **Scan**, выбери устройство, затем **Connect**
+3. Можно вставить address вручную и подключаться **без Scan**
 
-### Запуск логирования (рекомендуется по адресу)
+CSV по умолчанию пишется в папку `logs/` (или выбери путь кнопкой **Choose log file…**).
+
+### CLI
+
+Сканировать устройства рядом:
 
 ```bash
-python src/h64_logger.py --address "YOUR_DEVICE_ADDRESS" --scan-timeout 15
+source .venv/bin/activate
+python src/h64_logger.py --list --scan-timeout 12
 ```
 
-### Запуск по подсказке имени
+Подключиться и писать CSV:
 
 ```bash
-python src/h64_logger.py --name "h64" --scan-timeout 15
+source .venv/bin/activate
+python src/h64_logger.py --address "ВАШ_UUID_АДРЕС" --scan-timeout 12
 ```
 
-Остановить запись: **Ctrl + C** (скрипт корректно закрывает файл).
+Остановка: `Ctrl+C`.
 
 ---
 
-## Файлы логов
+## Права Bluetooth на macOS
 
-По умолчанию создаются файлы:
+macOS может спросить доступ к Bluetooth. Разреши доступ для:
+- **Terminal** (если запускаешь из терминала)
+- или **VS Code** (если запускаешь из VS Code / встроенного терминала)
 
-- `logs/h64_hr_log_YYYYMMDD_HHMMSS.csv`
-
-Колонки CSV:
-
-- `timestamp` — ISO‑время (секунды)
-- `bpm` — текущий пульс
-- `battery_percent` — заряд батареи (%), если доступно (иначе пусто)
+Если доступ был запрещён:
+System Settings → Privacy & Security → Bluetooth → включи доступ для нужного приложения.
 
 ---
 
-## Разрешения Bluetooth на macOS
+## Troubleshooting
 
-Если сканирование/подключение не работает, проверьте:
+### Датчик не находится
+- надень датчик/ремень (H64 “спит”, если не надет)
+- убедись, что он не подключён к другой программе (Zwift/сканер и т.п.)
+- увеличь scan timeout
 
-- **System Settings → Privacy & Security → Bluetooth**  
-  Разрешите Bluetooth для **Terminal** и/или **Visual Studio Code** (в зависимости от того, где запускаете скрипт).
-
----
-
-## Замечания
-
-- Имя датчика в рекламе может быть нестабильным — **подключение по адресу** обычно самое надёжное.
-- Battery Level зависит от прошивки/реализации датчика: некоторые устройства дают 0x2A19 всегда, некоторые — только иногда или не дают вовсе.
+### После Connect “ничего не происходит”
+- проверь права Bluetooth (Terminal/VS Code)
+- попробуй CLI `--list` и возьми address оттуда
+- если address изменился — сделай Scan и подключись снова (GUI сохранит новый)
 
 ---
 
-## Лицензия
-
-Пока не выбрана. Можно добавить `MIT` (или другую) при необходимости.
+## Дисклеймер
+Учебный проект. Не медицинское ПО.
